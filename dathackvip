@@ -1,0 +1,787 @@
+-- Tên script: FootPlankGenerator (LocalScript)
+-- Đặt trong: StarterPlayerScripts
+-- Tính năng: Chống giật lùi Anti-Cheat, nút ON/OFF kéo thả, ván cầu vồng
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+-- CẤU HÌNH
+local CONFIG = {
+	PlankSize = Vector3.new(6, 0.3, 6),
+	Material = Enum.Material.Neon,
+	Transparency = 0.1,
+	Spacing = 5.5,
+	
+	-- Số lượng ván
+	MaxPlanks = 36,
+	KeepDistance = 10,
+	DestroyDistance = 12,
+	ForceDestroyDistance = 15,
+	CleanupInterval = 0.1,
+	
+	-- Tốc độ tạo ván
+	GenerateInterval = 0.04,
+	MovementThreshold = 0.3,
+	
+	-- Cơ chế nhảy
+	JumpPlankOffset = 0,
+	JumpCooldown = 0.15,
+	
+	-- Màu sắc
+	RainbowSpeed = 3,
+	ColorChangeInterval = 0.04,
+	
+	-- 🛡️ CHỐNG GIẬT LÙI ANTI-CHEAT
+	AntiLagEnabled = true,           -- Bật chống giật
+	NetworkOwnershipTransfer = true, -- Chuyển ownership ván cho client
+	VelocitySync = true,             -- Đồng bộ vận tốc
+	AntiTeleport = true,             -- Chống dịch chuyển đột ngột
+}
+
+-- 7 màu cầu vồng
+local RAINBOW_COLORS = {
+	Color3.fromRGB(255, 0, 0),
+	Color3.fromRGB(255, 127, 0),
+	Color3.fromRGB(255, 255, 0),
+	Color3.fromRGB(0, 255, 0),
+	Color3.fromRGB(0, 0, 255),
+	Color3.fromRGB(75, 0, 130),
+	Color3.fromRGB(148, 0, 211),
+}
+
+-- Biến lưu trữ
+local planks = {}
+local lastPosition = nil
+local lastGenerateTime = 0
+local lastJumpGenerateTime = 0
+local isGeneratorEnabled = true
+local rainbowIndex = 1
+local lastColorUpdate = 0
+local wasOnGround = true
+local lastCleanupTime = 0
+
+-- 🛡️ Biến chống giật
+local lastNetworkTick = 0
+local lastPositionHash = ""
+local antiLagActive = false
+
+-- Cập nhật màu ván
+local function updateAllPlanksColors()
+	local currentColor = RAINBOW_COLORS[rainbowIndex]
+	for _, plank in ipairs(planks) do
+		if plank and plank.Parent then
+			plank.Color = currentColor
+			local light = plank:FindFirstChild("PointLight")
+			if light then
+				light.Color = currentColor
+			end
+		end
+	end
+end
+
+-- Kiểm tra di chuyển
+local function checkIfMoving()
+	if not humanoid or not humanoid.Parent then return false end
+	local rootVel = humanoidRootPart and humanoidRootPart.AssemblyLinearVelocity
+	if not rootVel then return false end
+	return math.sqrt(rootVel.X^2 + rootVel.Z^2) > CONFIG.MovementThreshold
+end
+
+-- Kiểm tra có đang ở trên không không
+local function isAirborne()
+	if not humanoid or not humanoid.Parent then return false end
+	return humanoid.FloorMaterial == Enum.Material.Air and not humanoid.Sit
+end
+
+-- 🛡️ CHUYỂN OWNERSHIP VÁN CHO CLIENT (chống giật)
+local function setPlankOwnership(plank)
+	if not CONFIG.NetworkOwnershipTransfer then return end
+	
+	-- Chuyển quyền sở hữu mạng cho client
+	pcall(function()
+		if plank:IsA("BasePart") then
+			plank:SetNetworkOwner(player)
+		end
+	end)
+end
+
+-- 🛡️ ĐỒNG BỘ VẬN TỐC NHÂN VẬT LÊN VÁN
+local function syncVelocityToPlanks()
+	if not CONFIG.VelocitySync then return end
+	if not humanoidRootPart then return end
+	
+	local playerVelocity = humanoidRootPart.AssemblyLinearVelocity
+	
+	for _, plank in ipairs(planks) do
+		if plank and plank.Parent then
+			-- Đồng bộ vận tốc để tránh hiện tượng trôi
+			pcall(function()
+				plank.AssemblyLinearVelocity = playerVelocity * 0.1
+			end)
+		end
+	end
+end
+
+-- 🛡️ KIỂM TRA VÀ NGĂN TELEPORT ĐỘT NGỘT
+local function checkAntiTeleport(currentPos)
+	if not CONFIG.AntiTeleport then return true end
+	if not lastPosition then return true end
+	
+	local distance = (currentPos - lastPosition).Magnitude
+	local deltaTime = tick() - lastNetworkTick
+	
+	-- Nếu nhảy quá xa trong 1 frame (có thể do anti-cheat kéo về)
+	if distance > 20 and deltaTime < 0.1 then
+		print("🛡️ Phát hiện dịch chuyển đột ngột: " .. string.format("%.1f", distance) .. " stud")
+		antiLagActive = true
+		return false
+	end
+	
+	antiLagActive = false
+	return true
+end
+
+-- 🛡️ TÁI TẠO VÁN SAU KHI BỊ GIẬT
+local function recoverFromLag()
+	if not antiLagActive then return end
+	
+	print("🛡️ Đang khôi phục sau giật lag...")
+	
+	-- Xóa ván bị lỗi gần đây
+	local currentPos = humanoidRootPart and humanoidRootPart.Position
+	if currentPos then
+		local toRemove = {}
+		for i, plank in ipairs(planks) do
+			if plank and plank.Parent then
+				local distance = (plank.Position - currentPos).Magnitude
+				if distance < 3 then
+					-- Giữ lại ván gần
+				elseif distance > 15 then
+					table.insert(toRemove, i)
+				end
+			end
+		end
+		
+		for i = #toRemove, 1, -1 do
+			local index = toRemove[i]
+			local plank = planks[index]
+			if plank and plank.Parent then
+				plank:Destroy()
+			end
+			table.remove(planks, index)
+		end
+	end
+	
+	-- Reset vị trí cuối để tạo lại ván
+	lastPosition = nil
+	
+	-- Tạo ván mới tại vị trí hiện tại
+	if humanoidRootPart then
+		local newPos = humanoidRootPart.Position - Vector3.new(0, 1.8, 0)
+		local newPlank = createPlank(newPos, false)
+		table.insert(planks, newPlank)
+		lastPosition = newPos
+	end
+	
+	antiLagActive = false
+end
+
+-- Tạo ván mới (có chống giật)
+local function createPlank(position, isJumpPlank)
+	local plank = Instance.new("Part")
+	plank.Name = isJumpPlank and "JumpPlank" or "FootPlank"
+	plank.Size = CONFIG.PlankSize
+	plank.Material = CONFIG.Material
+	plank.Transparency = CONFIG.Transparency
+	plank.Anchored = true
+	plank.CanCollide = true
+	plank.Locked = true
+	plank.Position = position
+	plank.Color = RAINBOW_COLORS[rainbowIndex]
+	
+	local glow = Instance.new("PointLight")
+	glow.Range = 6
+	glow.Brightness = 0.5
+	glow.Color = plank.Color
+	glow.Parent = plank
+	
+	-- 🛡️ Chuyển ownership cho client
+	setPlankOwnership(plank)
+	
+	plank.Parent = workspace
+	
+	plank.Transparency = 0.5
+	TweenService:Create(plank, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), 
+		{Transparency = CONFIG.Transparency}):Play()
+	
+	return plank
+end
+
+-- Xóa ván
+local function cleanupPlanks()
+	if not humanoidRootPart or not humanoidRootPart.Parent then 
+		for _, plank in ipairs(planks) do
+			if plank and plank.Parent then
+				plank:Destroy()
+			end
+		end
+		planks = {}
+		return 
+	end
+	
+	local currentPos = humanoidRootPart.Position
+	local toRemove = {}
+	
+	for i, plank in ipairs(planks) do
+		if not plank or not plank.Parent then
+			table.insert(toRemove, i)
+		else
+			local distance = (plank.Position - currentPos).Magnitude
+			if distance > CONFIG.KeepDistance then
+				table.insert(toRemove, i)
+			end
+		end
+	end
+	
+	for i = #toRemove, 1, -1 do
+		local index = toRemove[i]
+		local plank = planks[index]
+		if plank and plank.Parent then
+			pcall(function()
+				TweenService:Create(plank, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.In), 
+					{Transparency = 1}):Play()
+			end)
+			plank:Destroy()
+		end
+		table.remove(planks, index)
+	end
+	
+	-- Kiểm tra lần 2
+	local secondPass = {}
+	for i, plank in ipairs(planks) do
+		if plank and plank.Parent then
+			local distance = (plank.Position - currentPos).Magnitude
+			if distance > CONFIG.ForceDestroyDistance then
+				table.insert(secondPass, i)
+			end
+		end
+	end
+	
+	for i = #secondPass, 1, -1 do
+		local index = secondPass[i]
+		local plank = planks[index]
+		if plank and plank.Parent then
+			plank:Destroy()
+		end
+		table.remove(planks, index)
+	end
+	
+	-- Giới hạn số lượng
+	if #planks > CONFIG.MaxPlanks then
+		local sortedPlanks = {}
+		for i, plank in ipairs(planks) do
+			if plank and plank.Parent then
+				local dist = (plank.Position - currentPos).Magnitude
+				table.insert(sortedPlanks, {index = i, plank = plank, dist = dist})
+			end
+		end
+		
+		table.sort(sortedPlanks, function(a, b) return a.dist > b.dist end)
+		
+		local toDeleteCount = #sortedPlanks - CONFIG.MaxPlanks
+		for i = 1, toDeleteCount do
+			local plank = sortedPlanks[i].plank
+			if plank and plank.Parent then
+				plank:Destroy()
+			end
+			for j, p in ipairs(planks) do
+				if p == plank then
+					table.remove(planks, j)
+					break
+				end
+			end
+		end
+	end
+end
+
+-- Lực xóa mạnh
+local function forceCleanup()
+	if not humanoidRootPart or not humanoidRootPart.Parent then return end
+	
+	local currentPos = humanoidRootPart.Position
+	
+	for i = #planks, 1, -1 do
+		local plank = planks[i]
+		if plank and plank.Parent then
+			local distance = (plank.Position - currentPos).Magnitude
+			if distance > CONFIG.DestroyDistance then
+				plank:Destroy()
+				table.remove(planks, i)
+			end
+		else
+			table.remove(planks, i)
+		end
+	end
+end
+
+-- Vị trí ván
+local function getWalkingPlankPosition(currentPos)
+	if not lastPosition then
+		return Vector3.new(currentPos.X, currentPos.Y - 1.8, currentPos.Z)
+	end
+	
+	local direction = (Vector2.new(currentPos.X, currentPos.Z) - Vector2.new(lastPosition.X, lastPosition.Z)).Unit
+	local step = CONFIG.Spacing
+	
+	local newX = lastPosition.X + direction.X * step
+	local newZ = lastPosition.Z + direction.Y * step
+	local fixedY = lastPosition.Y
+	
+	return Vector3.new(newX, fixedY, newZ)
+end
+
+local function getJumpPlankPosition(currentPos)
+	return Vector3.new(currentPos.X, currentPos.Y - 1.8, currentPos.Z)
+end
+
+local function shouldGenerateWalkingPlank(currentPos)
+	if not isGeneratorEnabled then return false end
+	if not checkIfMoving() then return false end
+	if not lastPosition then return true end
+	
+	local horizontalDist = (Vector2.new(currentPos.X, currentPos.Z) - Vector2.new(lastPosition.X, lastPosition.Z)).Magnitude
+	return horizontalDist >= CONFIG.Spacing
+end
+
+-- Sinh ván
+local function generateWalkingPlank()
+	if not humanoidRootPart or not humanoidRootPart.Parent then
+		character = player.Character
+		if character then
+			humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+			humanoid = character:WaitForChild("Humanoid")
+		else
+			return
+		end
+	end
+	
+	local currentPos = humanoidRootPart.Position
+	
+	if shouldGenerateWalkingPlank(currentPos) then
+		local plankPosition = getWalkingPlankPosition(currentPos)
+		
+		local shouldCreate = true
+		for _, existingPlank in ipairs(planks) do
+			if existingPlank and existingPlank.Parent then
+				local dist = (Vector2.new(existingPlank.Position.X, existingPlank.Position.Z) - 
+							Vector2.new(plankPosition.X, plankPosition.Z)).Magnitude
+				if dist < 2 then
+					shouldCreate = false
+					break
+				end
+			end
+		end
+		
+		if shouldCreate then
+			local newPlank = createPlank(plankPosition, false)
+			table.insert(planks, newPlank)
+			lastPosition = plankPosition
+			spawnQuickEffect(plankPosition)
+		end
+	end
+end
+
+local function generateJumpPlank()
+	if not isGeneratorEnabled then return end
+	if not humanoidRootPart or not humanoidRootPart.Parent then return end
+	
+	local currentTime = tick()
+	if currentTime - lastJumpGenerateTime < CONFIG.JumpCooldown then return end
+	
+	local currentPos = humanoidRootPart.Position
+	local plankPosition = getJumpPlankPosition(currentPos)
+	
+	local shouldCreate = true
+	for _, existingPlank in ipairs(planks) do
+		if existingPlank and existingPlank.Parent then
+			local dist = (existingPlank.Position - plankPosition).Magnitude
+			if dist < 1.5 then
+				shouldCreate = false
+				break
+			end
+		end
+	end
+	
+	if shouldCreate then
+		local newPlank = createPlank(plankPosition, true)
+		table.insert(planks, newPlank)
+		lastJumpGenerateTime = currentTime
+		lastPosition = plankPosition
+		spawnJumpEffect(plankPosition)
+	end
+end
+
+local function generateAirbornePlank()
+	if not isGeneratorEnabled then return end
+	if not isAirborne() then return end
+	if not checkIfMoving() then return end
+	if not humanoidRootPart or not humanoidRootPart.Parent then return end
+	
+	local currentPos = humanoidRootPart.Position
+	
+	local shouldCreate = false
+	if lastPosition then
+		local horizontalDist = (Vector2.new(currentPos.X, currentPos.Z) - Vector2.new(lastPosition.X, lastPosition.Z)).Magnitude
+		shouldCreate = horizontalDist >= CONFIG.Spacing
+	else
+		shouldCreate = true
+	end
+	
+	if shouldCreate then
+		local plankPosition = getJumpPlankPosition(currentPos)
+		
+		local isDuplicate = false
+		for _, existingPlank in ipairs(planks) do
+			if existingPlank and existingPlank.Parent then
+				local dist = (existingPlank.Position - plankPosition).Magnitude
+				if dist < 2 then
+					isDuplicate = true
+					break
+				end
+			end
+		end
+		
+		if not isDuplicate then
+			local newPlank = createPlank(plankPosition, false)
+			table.insert(planks, newPlank)
+			lastPosition = plankPosition
+			spawnQuickEffect(plankPosition)
+		end
+	end
+end
+
+-- Hiệu ứng
+local function spawnQuickEffect(position)
+	for i = 1, 4 do
+		local part = Instance.new("Part")
+		part.Size = Vector3.new(0.3, 0.3, 0.3)
+		part.Position = position + Vector3.new(math.sin(i) * 1.5, 0.3, math.cos(i) * 1.5)
+		part.Anchored = true
+		part.CanCollide = false
+		part.Transparency = 0.5
+		part.Color = RAINBOW_COLORS[i % 7 + 1]
+		part.Material = Enum.Material.Neon
+		part.Parent = workspace
+		
+		TweenService:Create(part, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), 
+			{Size = Vector3.new(1, 0.3, 1), Transparency = 1}):Play()
+		Debris:AddItem(part, 0.15)
+	end
+end
+
+local function spawnJumpEffect(position)
+	for i = 1, 6 do
+		local angle = (i / 6) * math.pi * 2
+		local part = Instance.new("Part")
+		part.Size = Vector3.new(0.3, 0.3, 0.3)
+		part.Position = position + Vector3.new(math.cos(angle) * 1.5, 0.5, math.sin(angle) * 1.5)
+		part.Anchored = true
+		part.CanCollide = false
+		part.Transparency = 0.4
+		part.Color = RAINBOW_COLORS[i % 7 + 1]
+		part.Material = Enum.Material.Neon
+		part.Parent = workspace
+		
+		TweenService:Create(part, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), 
+			{Size = Vector3.new(0.8, 0.3, 0.8), Transparency = 1}):Play()
+		Debris:AddItem(part, 0.2)
+	end
+end
+
+-- Reset nhân vật
+local function onCharacterAdded(newCharacter)
+	character = newCharacter
+	humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+	humanoid = character:WaitForChild("Humanoid")
+	
+	for _, plank in ipairs(planks) do
+		if plank and plank.Parent then
+			plank:Destroy()
+		end
+	end
+	planks = {}
+	lastPosition = nil
+	lastGenerateTime = 0
+	lastJumpGenerateTime = 0
+	wasOnGround = true
+	antiLagActive = false
+	
+	task.wait(0.1)
+	if humanoidRootPart then
+		local startPos = humanoidRootPart.Position - Vector3.new(0, 1.8, 0)
+		local firstPlank = createPlank(startPos, false)
+		table.insert(planks, firstPlank)
+		lastPosition = startPos
+	end
+end
+
+player.CharacterAdded:Connect(onCharacterAdded)
+
+-- 🔘 NÚT ON/OFF (giữ nguyên)
+local function createDraggableToggleButton()
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "PlankToggleGUI"
+	screenGui.Parent = player:WaitForChild("PlayerGui")
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0, 100, 0, 50)
+	button.Position = UDim2.new(1, -115, 0, 15)
+	button.Text = ""
+	button.BackgroundColor3 = Color3.fromRGB(34, 139, 34)
+	button.BackgroundTransparency = 0.15
+	button.BorderSizePixel = 0
+	button.AutoButtonColor = false
+	button.Parent = screenGui
+	
+	local btnCorner = Instance.new("UICorner")
+	btnCorner.CornerRadius = UDim.new(0, 12)
+	btnCorner.Parent = button
+	
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 3
+	stroke.Color = RAINBOW_COLORS[1]
+	stroke.Transparency = 0.3
+	stroke.Parent = button
+	
+	local buttonText = Instance.new("TextLabel")
+	buttonText.Size = UDim2.new(1, 0, 1, 0)
+	buttonText.BackgroundTransparency = 1
+	buttonText.TextColor3 = Color3.fromRGB(255, 255, 255)
+	buttonText.TextSize = 28
+	buttonText.Text = "ON"
+	buttonText.Font = Enum.Font.GothamBold
+	buttonText.TextScaled = true
+	buttonText.TextWrapped = true
+	buttonText.Parent = button
+	
+	local dragging = false
+	local dragStartPos = nil
+	local dragStartMousePos = nil
+	
+	local function updateButtonUI()
+		if isGeneratorEnabled then
+			button.BackgroundColor3 = Color3.fromRGB(34, 139, 34)
+			buttonText.Text = "ON"
+			buttonText.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			button.BackgroundColor3 = Color3.fromRGB(139, 34, 34)
+			buttonText.Text = "OFF"
+			buttonText.TextColor3 = Color3.fromRGB(200, 200, 200)
+		end
+	end
+	
+	local function animatePress()
+		local originalSize = button.Size
+		local originalTrans = button.BackgroundTransparency
+		button.Size = UDim2.new(0, 95, 0, 46)
+		button.BackgroundTransparency = 0.3
+		task.wait(0.05)
+		button.Size = originalSize
+		button.BackgroundTransparency = originalTrans
+	end
+	
+	local function showNotification(message)
+		local notify = Instance.new("TextLabel")
+		notify.Size = UDim2.new(0, 200, 0, 40)
+		notify.Position = UDim2.new(0.5, -100, 0.5, -20)
+		notify.Text = message
+		notify.TextColor3 = RAINBOW_COLORS[rainbowIndex]
+		notify.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+		notify.BackgroundTransparency = 0.3
+		notify.TextSize = 16
+		notify.Font = Enum.Font.GothamBold
+		notify.TextScaled = true
+		notify.Parent = screenGui
+		
+		local notifyCorner = Instance.new("UICorner")
+		notifyCorner.CornerRadius = UDim.new(0, 12)
+		notifyCorner.Parent = notify
+		
+		local notifyStroke = Instance.new("UIStroke")
+		notifyStroke.Thickness = 2
+		notifyStroke.Color = RAINBOW_COLORS[rainbowIndex]
+		notifyStroke.Parent = notify
+		
+		task.wait(1)
+		notify:Destroy()
+	end
+	
+	local function toggleGenerator()
+		isGeneratorEnabled = not isGeneratorEnabled
+		updateButtonUI()
+		animatePress()
+		
+		if isGeneratorEnabled then
+			showNotification("ON - BẬT TẠO VÁN")
+		else
+			showNotification("OFF - TẮT TẠO VÁN")
+		end
+	end
+	
+	local function setupDragEvents()
+		local moveConn
+		local endConn
+		
+		button.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+			   input.UserInputType == Enum.UserInputType.Touch then
+				
+				dragStartPos = button.Position
+				dragStartMousePos = input.Position
+				
+				moveConn = UserInputService.InputChanged:Connect(function(changeInput)
+					if changeInput.UserInputType == Enum.UserInputType.MouseMovement or
+					   changeInput.UserInputType == Enum.UserInputType.Touch then
+						
+						if not dragging then
+							local dist = (changeInput.Position - dragStartMousePos).Magnitude
+							if dist > 10 then
+								dragging = true
+							end
+						end
+						
+						if dragging then
+							local delta = changeInput.Position - dragStartMousePos
+							local newX = dragStartPos.X.Offset + delta.X
+							local newY = dragStartPos.Y.Offset + delta.Y
+							
+							local viewportSize = player:GetMouse().ViewSizeX
+							local viewportHeight = player:GetMouse().ViewSizeY
+							
+							newX = math.clamp(newX, 10, viewportSize - button.AbsoluteSize.X - 10)
+							newY = math.clamp(newY, 10, viewportHeight - button.AbsoluteSize.Y - 60)
+							
+							button.Position = UDim2.new(0, newX, 0, newY)
+						end
+					end
+				end)
+				
+				endConn = UserInputService.InputEnded:Connect(function(endInput)
+					if endInput.UserInputType == Enum.UserInputType.MouseButton1 or
+					   endInput.UserInputType == Enum.UserInputType.Touch then
+						
+						if moveConn then moveConn:Disconnect() end
+						if endConn then endConn:Disconnect() end
+						dragging = false
+					end
+				end)
+			end
+		end)
+	end
+	
+	button.MouseButton1Click:Connect(toggleGenerator)
+	button.TouchTap:Connect(toggleGenerator)
+	
+	setupDragEvents()
+	updateButtonUI()
+	
+	coroutine.wrap(function()
+		while true do
+			task.wait(0.05)
+			if isGeneratorEnabled then
+				stroke.Color = RAINBOW_COLORS[rainbowIndex]
+			end
+		end
+	end)()
+	
+	return button
+end
+
+createDraggableToggleButton()
+
+-- Theo dõi nhảy
+local function checkJumpAndAirborne()
+	local airborne = isAirborne()
+	
+	if airborne and wasOnGround then
+		task.wait(0.01)
+		generateJumpPlank()
+	end
+	
+	wasOnGround = not airborne
+end
+
+-- 🛡️ Vòng lặp chính với chống giật
+RunService.Heartbeat:Connect(function(deltaTime)
+	local currentTime = tick()
+	
+	-- Cập nhật màu cầu vồng
+	if currentTime - lastColorUpdate >= CONFIG.ColorChangeInterval then
+		rainbowIndex = (rainbowIndex % #RAINBOW_COLORS) + 1
+		updateAllPlanksColors()
+		lastColorUpdate = currentTime
+	end
+	
+	-- 🛡️ Kiểm tra và phát hiện giật lag
+	if humanoidRootPart and CONFIG.AntiTeleport then
+		local currentPos = humanoidRootPart.Position
+		local isValid = checkAntiTeleport(currentPos)
+		
+		if not isValid then
+			-- Bị kéo về, khôi phục sau 0.3 giây
+			task.wait(0.3)
+			recoverFromLag()
+		end
+		lastNetworkTick = currentTime
+	end
+	
+	-- Sinh ván khi di chuyển
+	if isGeneratorEnabled then
+		if currentTime - lastGenerateTime >= CONFIG.GenerateInterval then
+			generateWalkingPlank()
+			lastGenerateTime = currentTime
+		end
+	end
+	
+	-- Kiểm tra nhảy
+	checkJumpAndAirborne()
+	
+	-- Sinh ván khi đi trên không
+	if isGeneratorEnabled and isAirborne() and checkIfMoving() then
+		if currentTime - lastGenerateTime >= CONFIG.GenerateInterval * 0.8 then
+			generateAirbornePlank()
+			lastGenerateTime = currentTime
+		end
+	end
+	
+	-- 🛡️ Đồng bộ vận tốc để giảm giật
+	if CONFIG.VelocitySync then
+		syncVelocityToPlanks()
+	end
+	
+	-- Dọn dẹp ván
+	cleanupPlanks()
+	
+	-- Lực xóa mạnh
+	if currentTime - lastCleanupTime >= 0.5 then
+		forceCleanup()
+		lastCleanupTime = currentTime
+	end
+end)
+
+print("🛡️🛡️🛡️ FOOT PLANK GENERATOR - CHỐNG GIẬT ANTI-CHEAT 🛡️🛡️🛡️")
+print("   🛡️ Network Ownership: Đã bật (ván do client quản lý)")
+print("   🛡️ Velocity Sync: Đã bật (đồng bộ vận tốc)")
+print("   🛡️ Anti-Teleport: Đã bật (phát hiện kéo về)")
+print("   🛡️ Recovery: Tự động khôi phục sau khi bị giật")
+print("   🔘 Nút ON/OFF có thể kéo thả")
+print("   🗑️ Ván chỉ bị xóa theo khoảng cách")
